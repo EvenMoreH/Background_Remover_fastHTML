@@ -169,7 +169,7 @@ def download_page(filename: str, extension: str):
                 Link(rel="icon", href="images/favicon.png", type="image/png"),
             ),
             Body(
-                H1("Download Your File", style="margin-bottom: 2rem; margin-top: 1rem;"),
+                H1("Download Your File", style="margin-bottom: 2rem; margin-top: 3%;"),
                 Div(
                     P("File Preview", style="min-width: 220px;", cls="select"),
                     Br(),
