@@ -1,0 +1,127 @@
+/* Reset */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: Arial, Helvetica, sans-serif;
+    --font-size: clamp(1rem, 1.2vw, 2rem);
+    background-color: rgb(30, 30, 30);
+    color: whitesmoke;
+    accent-color: #292929;
+    transform: translateY(-2vh);
+  }
+
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    line-height: 1.6;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    margin: 0;
+    padding: 0;
+    font-size: var(--font-size);
+  }
+
+  form {
+    font-size: var(--font-size);
+  }
+
+  .browse {
+    font-size: var(--font-size);
+    max-width: 95%;
+  }
+
+  .select {
+    font-size: calc(var(--font-size) * 1.7);
+    font-variant-caps: all-petite-caps;
+  }
+
+  .preview {
+    max-height: 35vh;
+    width: auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+
+  /* Wrapper for Content */
+  .container {
+    width: 100%;
+    max-width: 1200px;
+    padding: 1rem;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+
+  /* Ensure Mobile Responsiveness */
+  @media (max-width: 768px) {
+    * {
+        font-family: Arial, Helvetica, sans-serif;
+        --font-size: clamp(1rem, 2vw, 2rem);
+        background-color: rgb(30, 30, 30);
+        color: whitesmoke;
+        accent-color: #292929;
+        transform: translateY(-2vh);
+    }
+
+    .container {
+        padding: 0.5rem;
+      }
+
+    .browse {
+        max-width: 80%;
+    }
+    .preview {
+      max-width: 256px;
+      max-height: 35vh;
+      height: auto;
+      width: auto;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+    }
+  }
+
+  /* Optional Additional Styling for Aesthetics */
+  h1, p {
+    margin: 1rem 0;
+    padding-left: 5%;
+    padding-right: 5%;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+
+  A {
+    color: whitesmoke;
+    font-size: var(--font-size);
+    text-decoration: none;
+    border-radius: 0.4rem;
+    border-color: whitesmoke;
+    background: #535557;
+    font-variant-caps: all-petite-caps;
+  }
+
+  button {
+    padding: 0.5rem 1rem;
+    border-radius: 0.4rem;
+    border-color: whitesmoke;
+    background: #535557;
+    color: whitesmoke;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: var(--font-size);
+    font-variant-caps: all-petite-caps;
+  }
