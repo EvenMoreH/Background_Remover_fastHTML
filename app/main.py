@@ -1,6 +1,6 @@
 from fasthtml.common import * # type: ignore
 from fasthtml.common import (
-    Form, Input, Button, Html, Head, Body, Div, P, Title, Titled, Base, Link, Br, A, Img, Meta, H1, UploadFile ,Response
+    Form, Input, Button, Html, Head, Body, Div, P, Title, Titled, Base, Link, Br, Script, Img, Meta, H1, UploadFile ,Response
 )
 from PIL import Image # type: ignore
 from rembg import remove # type: ignore
@@ -74,6 +74,8 @@ def homepage():
         Head(
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Title("Background Remover"),
+            # importing HTMX
+            Script(src="https://unpkg.com/htmx.org"),
             Link(rel="stylesheet", href="styles.css"),
             Link(rel="icon", href="images/favicon.ico", type="image/x-icon"),
             Link(rel="icon", href="images/favicon.png", type="image/png"),
@@ -163,6 +165,15 @@ def download_page(filename: str, extension: str):
                 # using base with only "/" to make the path absolute - works locally
                 Base(href="/"),
                 Meta(name="viewport", content="width=device-width, initial-scale=1"),
+                # importing HTMX
+                Script(src="https://unpkg.com/htmx.org"),
+                # JS function to address button onclick behavior dynamically
+                Script("""
+                    function download(filename, extension) {
+                        const url = `/download/${filename}/${extension}`;
+                        window.location.href = url;
+                    }
+                   """),
                 Title("Background Remover"),
                 Link(rel="stylesheet", href="styles.css"),
                 Link(rel="icon", href="images/favicon.ico", type="image/x-icon"),
@@ -182,10 +193,8 @@ def download_page(filename: str, extension: str):
                 ),
                 Div(
                     Button(
-                        A(
                         "Download File",
-                        href=f"/download/{filename}/{extension}",
-                        ),
+                        onclick=f"download('{filename}', '{extension}')",
                     ),
                     cls="container",
                 ),
@@ -194,7 +203,11 @@ def download_page(filename: str, extension: str):
                 ),
                 Div(
                     Button(
-                        A("Return to Home", href="/"),
+                        "Return to Home",
+                        hx_get="/",
+                        hx_target="body",
+                        # ensures the URL changes accordingly with the fetched endpoint
+                        hx_push_url="true",
                     ),
                     cls="container",
                 ),
