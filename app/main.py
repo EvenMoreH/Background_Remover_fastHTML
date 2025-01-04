@@ -11,6 +11,7 @@ from mimetypes import guess_type
 import os
 import time
 from datetime import datetime
+import unicodedata
 
 # for Docker
 app, rt = fast_app(static_path="static") # type: ignore
@@ -34,6 +35,20 @@ class GlobalFileName:
 
 class GlobalFileExtension:
     file_extension: str
+
+# thanks for below chat
+def encode_filename(filename):
+    # Normalize to NFKD form
+    encoded = unicodedata.normalize('NFKD', filename)
+    # Remove combining characters
+    ascii_equivalent = ''.join(
+        c for c in encoded if not unicodedata.combining(c)
+    )
+    # Replace specific Polish characters
+    polish_mapping = {
+        'ł': 'l', 'Ł': 'L',
+    }
+    return ''.join(polish_mapping.get(char, char) for char in ascii_equivalent)
 
 def remove_bg(image_path, output_path):
     with Image.open(image_path) as img:
@@ -81,19 +96,27 @@ def homepage():
             Link(rel="icon", href="images/favicon.png", type="image/png"),
         ),
         Body(
-            Titled("Image Background Remover"),
-            Form(
-                P("Select file", cls="select"),
-                Input(type="file", name="file", required=True, cls="browse"),
-                Br(),
-                Br(),
-                Br(),
-                Button("Upload and Remove Background", type="submit"),
-                method="post",
-                action="/upload",
-                enctype="multipart/form-data", # required for file uploading (to be researched),
-            ),
+            H1("Image Background Remover"),
+            Div(cls="container"),
+            Div(cls="container"),
+            Div(
+                Form(
+                    P("Select file", cls="select"),
+                    Div(cls="container"),
+                    Div(
+                        Input(type="file", name="file", required=True, cls="browse"),
+                        cls="container",
+                        ),
+                    Div(
+                        Button("Upload and Remove Background", type="submit"),
+                        cls="container",
+                        ),
+                    method="post",
+                    action="/upload",
+                    enctype="multipart/form-data", # required for file uploading (to be researched),
+                ),
             cls="container"
+            )
         )
     )
 
@@ -101,6 +124,10 @@ def homepage():
 @rt("/upload", methods=["GET", "POST"])
 async def upload(file: UploadFile = None):
     filebuffer = await file.read()  # Read file content
+
+    # encoding function to ensure name has no unsupported characters
+    file.filename = encode_filename(file.filename)
+
     GlobalPath.file_path = temp_dir / file.filename  # Define path to save file
     GlobalPath.file_path.write_bytes(filebuffer)  # Save file
 
@@ -109,7 +136,32 @@ async def upload(file: UploadFile = None):
     GlobalOutputPath.output_path = os.path.join(temp_dir, image_path.stem) + png_extension
 
     # conversion function call
-    remove_bg(image_path, GlobalOutputPath.output_path)
+    try:
+        remove_bg(image_path, GlobalOutputPath.output_path)
+    except UnicodeEncodeError as e:
+        return Html(
+            Titled("Processing Error"),
+            Body(Div(f"Unicode encoding error: {e}"),
+            Div(Form(
+                Button(
+                "Return Home",
+                type="submit",
+                ),
+            action="/",
+            method="get",
+            ))))
+    except Exception as e:
+        return Html(
+            Titled("Processing Error"),
+            Body(Div(f"Processing Error: {e}"),
+            Div(Form(
+                Button(
+                "Return Home",
+                type="submit",
+                ),
+            action="/",
+            method="get",
+            ))))
 
     GlobalFileName.file_name = GlobalPath.file_path.stem  # extracts main file name
     GlobalFileExtension.file_extension = png_extension.lstrip('.')
@@ -123,11 +175,14 @@ async def upload(file: UploadFile = None):
             Link(rel="icon", href="images/favicon.png", type="image/png"),
         ),
         Body(
-            Titled("File Uploaded Successfully"),
+            H1("File Uploaded Successfully"),
+            Div(cls="container"),
+            Div(cls="container"),
             Div(
                 P(f"File \"{file.filename}\" was uploaded successfully and background was removed."),
+                Div(cls="container"),
                 P(f"File was saved as: \"{GlobalFileName.file_name}.{GlobalFileExtension.file_extension}\""),
-                Br(),
+                Div(cls="container"),
                 Form(
                     Button("Go To Downloads", type="submit"),
                     method="get",
@@ -151,11 +206,36 @@ async def download(filename: str, extension: str):
         mime_type = "application/octet-stream"  # Default fallback
 
     # Serve the file with a proper Content-Disposition header
-    return FileResponse(
-        GlobalOutputPath.output_path,
-        media_type=mime_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}.{extension}"'}
-    )
+    try:
+        return FileResponse(
+            GlobalOutputPath.output_path,
+            media_type=mime_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}.{extension}"'}
+        )
+    except UnicodeEncodeError as e:
+        return Html(
+            Titled("Processing Error"),
+            Body(Div(f"Unicode encoding error: {e}"),
+            Div(Form(
+                Button(
+                "Return Home",
+                type="submit",
+                ),
+            action="/",
+            method="get",
+            ))))
+    except Exception as e:
+        return Html(
+            Titled("Processing Error"),
+            Body(Div(f"Processing Error: {e}"),
+            Div(Form(
+                Button(
+                "Return Home",
+                type="submit",
+                ),
+            action="/",
+            method="get",
+            ))))
 
 @rt("/page/{filename}/{extension}", methods=["GET"])
 def download_page(filename: str, extension: str):
@@ -180,16 +260,17 @@ def download_page(filename: str, extension: str):
                 Link(rel="icon", href="images/favicon.png", type="image/png"),
             ),
             Body(
-                H1("Download Your File", style="margin-bottom: 2rem; margin-top: 5%;"),
                 Div(
-                    P("File Preview", style="min-width: 220px;", cls="select"),
-                    Br(),
-                    Img(src=f"/download/{filename}/{extension}", alt="img", cls="preview"),
+                    H1("Download Your File", style="margin-top: 5%;"),
                     cls="container",
-                    )
                 ),
                 Div(
-                    Br(),
+                    P("File Preview", style="min-width: 220px;", cls="select"),
+                    cls="container",
+                ),
+                Div(
+                    Img(src=f"/download/{filename}/{extension}", alt="img", cls="preview"),
+                    cls="container",
                 ),
                 Div(
                     Button(
@@ -197,9 +278,6 @@ def download_page(filename: str, extension: str):
                         onclick=f"download('{filename}', '{extension}')",
                     ),
                     cls="container",
-                ),
-                Div(
-                    Br()
                 ),
                 Div(
                     Button(
@@ -212,6 +290,7 @@ def download_page(filename: str, extension: str):
                     cls="container",
                 ),
             )
+    )
 
 if __name__ == '__main__':
     # Important: Use host='0.0.0.0' to make the server accessible outside the container
