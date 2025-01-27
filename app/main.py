@@ -14,10 +14,10 @@ from datetime import datetime
 import unicodedata
 
 # for Docker
-app, rt = fast_app(static_path="static") # type: ignore
+# app, rt = fast_app(static_path="static") # type: ignore
 
 # for local
-# app, rt = fast_app(static_path="app/static") # type: ignore
+app, rt = fast_app(static_path="app/static") # type: ignore
 
 
 temp_dir = Path("app/temp")
@@ -101,19 +101,21 @@ def homepage():
             Div(cls="container"),
             Div(
                 Form(
-                    P("Select file", cls="select"),
-                    Div("Processing...", id="processing", style="color: rgba(245, 245, 245, 0);"),
-                    Div(cls="container"),
+                    P("Select file", id="select", cls="select"),
+                    Div(style="padding: 1vh"),
                     Div(
                         Input(type="file", name="file", required=True, cls="browse"),
                         cls="container",
                         ),
                     Div(
                         Button("Upload and Remove Background", type="submit",
-                               # using line of JS to swap color for hidden processing message
-                               onclick="document.getElementById('processing').style.color = 'whitesmoke';"),
-                        cls="container",
+                               # using line of JS to swap Select File to Processing message
+                                onclick="""
+                                    document.getElementById('select').innerText = 'Processing...';
+                                """,
                         ),
+                        cls="container",
+                    ),
                     method="post",
                     action="/upload",
                     enctype="multipart/form-data", # required for file uploading (to be researched),
