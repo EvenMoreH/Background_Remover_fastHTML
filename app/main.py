@@ -102,13 +102,16 @@ def homepage():
             Div(
                 Form(
                     P("Select file", cls="select"),
+                    Div("Processing...", id="processing", style="color: rgba(245, 245, 245, 0);"),
                     Div(cls="container"),
                     Div(
                         Input(type="file", name="file", required=True, cls="browse"),
                         cls="container",
                         ),
                     Div(
-                        Button("Upload and Remove Background", type="submit"),
+                        Button("Upload and Remove Background", type="submit",
+                               # using line of JS to swap color for hidden processing message
+                               onclick="document.getElementById('processing').style.color = 'whitesmoke';"),
                         cls="container",
                         ),
                     method="post",
