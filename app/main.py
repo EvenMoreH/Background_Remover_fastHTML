@@ -14,10 +14,10 @@ from datetime import datetime
 import unicodedata
 
 # for Docker
-# app, rt = fast_app(static_path="static") # type: ignore
+app, rt = fast_app(static_path="static") # type: ignore
 
 # for local
-app, rt = fast_app(static_path="app/static") # type: ignore
+# app, rt = fast_app(static_path="app/static") # type: ignore
 
 
 temp_dir = Path("app/temp")
