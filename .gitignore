@@ -173,3 +173,5 @@ cython_debug/
 #custom
 notes.md
 .sesskey
+# app temp files
+app/temp/

@@ -1,302 +1,283 @@
-from fasthtml.common import * # type: ignore
-from fasthtml.common import (
-    Form, Input, Button, Html, Head, Body, Div, P, Title, Titled, Base, Link, Br, Script, Img, Meta, H1, UploadFile ,Response
-)
-from PIL import Image # type: ignore
-from rembg import remove # type: ignore
-import onnxruntime as ort # type: ignore
-from pathlib import Path
-from starlette.responses import FileResponse
-from mimetypes import guess_type
+import asyncio
+import logging
 import os
+import re
+import shutil
+import sys
+import threading
 import time
-from datetime import datetime
-import unicodedata
+import uuid
+from io import BytesIO
+from pathlib import Path, PurePosixPath
+from typing import cast
 
-# for Docker
-app, rt = fast_app(static_path="static") # type: ignore
+from fasthtml.common import *  # type: ignore
+from fasthtml.common import (
+    H1,
+    A,
+    Body,
+    Button,
+    Div,
+    Form,
+    Head,
+    Html,
+    Img,
+    Input,
+    Label,
+    Link,
+    Meta,
+    Option,
+    P,
+    Select,
+    Title,
+    UploadFile,
+    to_xml,
+)
+from PIL import Image, ImageOps, UnidentifiedImageError  # type: ignore
+from rembg import new_session, remove  # type: ignore
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse
 
-# for local
-# app, rt = fast_app(static_path="app/static") # type: ignore
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bg-remover")
+
+# paths are relative to this file, so the app works the same locally and in Docker
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+TEMP_DIR = BASE_DIR / "temp"
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_PIXELS = 40_000_000           # ~40 MP, bigger images are rejected to protect memory
+FILE_MAX_AGE = 24 * 60 * 60       # results are kept for 24h
+CLEANUP_INTERVAL = 60 * 60        # cleanup runs every hour
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+
+# key used in the form -> (rembg model name, label shown to the user)
+# NOTE: keep in sync with the model pre-download step in the Dockerfile
+MODELS = {
+    "standard": ("isnet-general-use", "Standard (fast)"),
+    "quality": ("birefnet-general", "High quality (slower)"),
+}
+DEFAULT_MODEL = "standard"
+
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-temp_dir = Path("app/temp")
-temp_dir.mkdir(parents=True, exist_ok=True)
+class UserError(Exception):
+    """Error with a message that is safe to show to the user."""
 
-# using a class here so I can have a proper type assign to paths and names that is used globally
-class GlobalPath:
-    file_path: Path
 
-class GlobalOutputPath:
-    output_path: str
+# model sessions are expensive to create, so each one is loaded once and reused
+_sessions = {}
+_sessions_lock = threading.Lock()
 
-class GlobalFileName:
-    file_name: str
+def get_session(model_key):
+    with _sessions_lock:
+        if model_key not in _sessions:
+            model_name = MODELS[model_key][0]
+            log.info(f"Loading model: {model_name}")
+            _sessions[model_key] = new_session(model_name)
+        return _sessions[model_key]
 
-class GlobalFileExtension:
-    file_extension: str
 
-# thanks for below chat
-def encode_filename(filename):
-    # Normalize to NFKD form
-    encoded = unicodedata.normalize('NFKD', filename)
-    # Remove combining characters
-    ascii_equivalent = ''.join(
-        c for c in encoded if not unicodedata.combining(c)
-    )
-    # Replace specific Polish characters
-    polish_mapping = {
-        'ł': 'l', 'Ł': 'L',
-    }
-    return ''.join(polish_mapping.get(char, char) for char in ascii_equivalent)
+def remove_bg(data: bytes, output_path: Path, model_key: str, alpha_matting: bool):
+    try:
+        img = Image.open(BytesIO(data))
+    except (UnidentifiedImageError, Image.DecompressionBombError):
+        raise UserError("This file is not a supported image.")
 
-def remove_bg(image_path, output_path):
-    with Image.open(image_path) as img:
+    with img:
+        if img.width * img.height > MAX_PIXELS:
+            raise UserError(f"Image is too large ({img.width}x{img.height}). Maximum is about {MAX_PIXELS // 1_000_000} megapixels.")
+
+        # phone photos store rotation in EXIF - apply it so the output isn't sideways
+        # (it only returns None with in_place=True, so the result is always an image here)
+        img = cast(Image.Image, ImageOps.exif_transpose(img))
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGBA")
 
-        output_img = remove(img)
+        # rembg returns the same type it was given - a PIL image in this case
+        output_img = cast(Image.Image, remove(img, session=get_session(model_key), alpha_matting=alpha_matting))
 
-        output_img.save(output_path, format='PNG')
+    output_img.save(output_path, format="PNG")
+
+
+def safe_stem(filename):
+    # keep only the base name (no directories) and drop unprintable characters
+    name = PurePosixPath((filename or "").replace("\\", "/")).name
+    stem = "".join(c for c in Path(name).stem if c.isprintable()).strip()
+    return stem[:100] or "image"
+
+
+def get_job_dir(job_id):
+    # job ids are generated by us - anything else is rejected, so it can't point outside TEMP_DIR
+    if not JOB_ID_RE.match(job_id):
+        return None
+    job_dir = TEMP_DIR / job_id
+    return job_dir if job_dir.is_dir() else None
+
+
+def get_result_file(job_dir):
+    return next(job_dir.glob("*.png"), None)
+
 
 # removing temp files
 def remove_old_files(folder, seconds):
-    # Calculate the threshold time (in seconds)
-    now = time.time()
-    age_threshold = now - seconds  # 2 days = 2 * 86400 seconds
+    age_threshold = time.time() - seconds
 
-    for filename in os.listdir(folder):
-        file_path = os.path.join(folder, filename)
+    for path in folder.iterdir():
+        if path.stat().st_mtime < age_threshold:
+            log.info(f"Removing old file: {path}")
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
-        # Check if it's a file
-        if os.path.isfile(file_path):
-            # Get the file's last modified time
-            file_mtime = os.path.getmtime(file_path)
 
-            # Check if the file is older than the threshold
-            if file_mtime < age_threshold:
-                log_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                print(f"LOG: {log_time} - Removing old file: {file_path}")
-                os.remove(file_path)  # Delete the file
+async def cleanup_loop():
+    while True:
+        try:
+            await asyncio.to_thread(remove_old_files, TEMP_DIR, FILE_MAX_AGE)
+        except Exception:
+            log.exception("Cleanup failed")
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+
+background_tasks = set()
+
+async def on_startup():
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    background_tasks.add(asyncio.create_task(cleanup_loop()))
+    # load the default model up front so the first upload isn't slow
+    await asyncio.to_thread(get_session, DEFAULT_MODEL)
+
+
+app, rt = fast_app(static_path=str(STATIC_DIR), on_startup=[on_startup]) # type: ignore
+
+# limits how many images are processed at the same time (each one uses a lot of CPU and RAM)
+processing_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+def page(*content, title="Background Remover"):
+    return Html(
+        Head(
+            Meta(charset="utf-8"),
+            Meta(name="viewport", content="width=device-width, initial-scale=1"),
+            Title(title),
+            Link(rel="stylesheet", href="/styles.css"),
+            Link(rel="icon", href="/images/favicon.ico", type="image/x-icon"),
+            Link(rel="icon", href="/images/favicon.png", type="image/png"),
+        ),
+        Body(Div(*content, cls="container")),
+    )
+
+
+def error_page(message, status_code=400):
+    content = page(
+        H1("Something went wrong"),
+        P(message, cls="error"),
+        A("Return Home", href="/", cls="button"),
+        title="Processing Error",
+    )
+    return HTMLResponse(to_xml(content), status_code=status_code)
 
 
 @rt("/")
 def homepage():
-    time_to_remove = 86400
-    remove_old_files(temp_dir, time_to_remove)  # Removes files older than [in seconds]
-
-    return Html(
-        Head(
-            Meta(name="viewport", content="width=device-width, initial-scale=1"),
-            Title("Background Remover"),
-            # importing HTMX
-            Script(src="https://unpkg.com/htmx.org"),
-            Link(rel="stylesheet", href="styles.css"),
-            Link(rel="icon", href="images/favicon.ico", type="image/x-icon"),
-            Link(rel="icon", href="images/favicon.png", type="image/png"),
-        ),
-        Body(
-            H1("Image Background Remover"),
-            Div(cls="container"),
-            Div(cls="container"),
-            Div(
-                Form(
-                    P("Select file", id="select", cls="select"),
-                    Div(style="padding: 1vh"),
-                    Div(
-                        Input(type="file", name="file", required=True, cls="browse"),
-                        cls="container",
-                        ),
-                    Div(
-                        Button("Upload and Remove Background", type="submit",
-                               # using line of JS to swap Select File to Processing message
-                                onclick="""
-                                    document.getElementById('select').innerText = 'Processing...';
-                                """,
-                        ),
-                        cls="container",
-                    ),
-                    method="post",
-                    action="/upload",
-                    enctype="multipart/form-data", # required for file uploading (to be researched),
+    return page(
+        H1("Image Background Remover"),
+        Form(
+            P("Select file", id="status", cls="select"),
+            Input(type="file", name="file", accept="image/*", required=True, cls="browse"),
+            P(f"Max {MAX_UPLOAD_MB} MB - JPG, PNG, WEBP, etc.", cls="hint"),
+            Label(
+                "Quality",
+                Select(
+                    *[Option(label, value=key, selected=key == DEFAULT_MODEL) for key, (_, label) in MODELS.items()],
+                    name="model",
                 ),
-            cls="container"
-            )
-        )
-    )
-
-# handles uploading file to temp location and removes it after conversion button is pressed
-@rt("/upload", methods=["GET", "POST"])
-async def upload(file: UploadFile = None):
-    filebuffer = await file.read()  # Read file content
-
-    # encoding function to ensure name has no unsupported characters
-    file.filename = encode_filename(file.filename)
-
-    GlobalPath.file_path = temp_dir / file.filename  # Define path to save file
-    GlobalPath.file_path.write_bytes(filebuffer)  # Save file
-
-    image_path = GlobalPath.file_path
-    png_extension = ".png"
-    GlobalOutputPath.output_path = os.path.join(temp_dir, image_path.stem) + png_extension
-
-    # conversion function call
-    try:
-        remove_bg(image_path, GlobalOutputPath.output_path)
-    except UnicodeEncodeError as e:
-        return Html(
-            Titled("Processing Error"),
-            Body(Div(f"Unicode encoding error: {e}"),
-            Div(Form(
-                Button(
-                "Return Home",
-                type="submit",
-                ),
-            action="/",
-            method="get",
-            ))))
-    except Exception as e:
-        return Html(
-            Titled("Processing Error"),
-            Body(Div(f"Processing Error: {e}"),
-            Div(Form(
-                Button(
-                "Return Home",
-                type="submit",
-                ),
-            action="/",
-            method="get",
-            ))))
-
-    GlobalFileName.file_name = GlobalPath.file_path.stem  # extracts main file name
-    GlobalFileExtension.file_extension = png_extension.lstrip('.')
-
-    return Html(
-        Head(
-            Meta(name="viewport", content="width=device-width, initial-scale=1"),
-            Title("Background Remover"),
-            Link(rel="stylesheet", href="styles.css"),
-            Link(rel="icon", href="images/favicon.ico", type="image/x-icon"),
-            Link(rel="icon", href="images/favicon.png", type="image/png"),
-        ),
-        Body(
-            H1("File Uploaded Successfully"),
-            Div(cls="container"),
-            Div(cls="container"),
-            Div(
-                P(f"File \"{file.filename}\" was uploaded successfully and background was removed."),
-                Div(cls="container"),
-                P(f"File was saved as: \"{GlobalFileName.file_name}.{GlobalFileExtension.file_extension}\""),
-                Div(cls="container"),
-                Form(
-                    Button("Go To Downloads", type="submit"),
-                    method="get",
-                    action=f"/page/{GlobalFileName.file_name}/{GlobalFileExtension.file_extension}",
-                    cls="container"
-                )
-            )
-        )
-    )
-
-
-@rt("/download/{filename}/{extension}", methods=["GET"])
-async def download(filename: str, extension: str):
-    # Ensure the file exists
-    if not os.path.exists(GlobalOutputPath.output_path):
-        return Response("File not found", status_code=404)
-
-    # Guess MIME type
-    mime_type, _ = guess_type(GlobalOutputPath.output_path)
-    if not mime_type:
-        mime_type = "application/octet-stream"  # Default fallback
-
-    # Serve the file with a proper Content-Disposition header
-    try:
-        return FileResponse(
-            GlobalOutputPath.output_path,
-            media_type=mime_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}.{extension}"'}
-        )
-    except UnicodeEncodeError as e:
-        return Html(
-            Titled("Processing Error"),
-            Body(Div(f"Unicode encoding error: {e}"),
-            Div(Form(
-                Button(
-                "Return Home",
-                type="submit",
-                ),
-            action="/",
-            method="get",
-            ))))
-    except Exception as e:
-        return Html(
-            Titled("Processing Error"),
-            Body(Div(f"Processing Error: {e}"),
-            Div(Form(
-                Button(
-                "Return Home",
-                type="submit",
-                ),
-            action="/",
-            method="get",
-            ))))
-
-@rt("/page/{filename}/{extension}", methods=["GET"])
-def download_page(filename: str, extension: str):
-    # Create a FastHTML page with a download link and other elements
-    return Html(
-            Head(
-                # using base with only "/" to make the path absolute - works locally
-                Base(href="/"),
-                Meta(name="viewport", content="width=device-width, initial-scale=1"),
-                # importing HTMX
-                Script(src="https://unpkg.com/htmx.org"),
-                # JS function to address button onclick behavior dynamically
-                Script("""
-                    function download(filename, extension) {
-                        const url = `/download/${filename}/${extension}`;
-                        window.location.href = url;
-                    }
-                   """),
-                Title("Background Remover"),
-                Link(rel="stylesheet", href="styles.css"),
-                Link(rel="icon", href="images/favicon.ico", type="image/x-icon"),
-                Link(rel="icon", href="images/favicon.png", type="image/png"),
+                cls="option",
             ),
-            Body(
-                Div(
-                    H1("Download Your File", style="margin-top: 5%;"),
-                    cls="container",
-                ),
-                Div(
-                    P("File Preview", style="min-width: 220px;", cls="select"),
-                    cls="container",
-                ),
-                Div(
-                    Img(src=f"/download/{filename}/{extension}", alt="img", cls="preview"),
-                    cls="container",
-                ),
-                Div(
-                    Button(
-                        "Download File",
-                        onclick=f"download('{filename}', '{extension}')",
-                    ),
-                    cls="container",
-                ),
-                Div(
-                    Button(
-                        "Return to Home",
-                        hx_get="/",
-                        hx_target="body",
-                        # ensures the URL changes accordingly with the fetched endpoint
-                        hx_push_url="true",
-                    ),
-                    cls="container",
-                ),
-            )
+            Label(
+                Input(type="checkbox", name="alpha_matting"),
+                "Refine hair / fur edges (slower)",
+                cls="option",
+            ),
+            Button("Upload and Remove Background", type="submit", cls="bold"),
+            method="post",
+            action="/upload",
+            enctype="multipart/form-data", # required for file uploads
+            # swap "Select file" to a processing message and block double submits
+            onsubmit="document.getElementById('status').innerText = 'Processing...'; this.querySelector('button').disabled = true;",
+            cls="container",
+        ),
     )
+
+
+@rt("/upload", methods=["POST"])
+async def upload(file: UploadFile, model: str = DEFAULT_MODEL, alpha_matting: bool = False):
+    if not isinstance(file, UploadFile) or not file.filename:
+        return error_page("No file was uploaded.")
+    if model not in MODELS:
+        return error_page("Unknown quality option.")
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        return error_page(f"File is too large. Maximum size is {MAX_UPLOAD_MB} MB.", status_code=413)
+
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return error_page(f"File is too large. Maximum size is {MAX_UPLOAD_MB} MB.", status_code=413)
+
+    # every upload gets its own random folder, so users never see or overwrite each other's files
+    job_id = uuid.uuid4().hex
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True)
+    output_path = job_dir / f"{safe_stem(file.filename)}_nobg.png"
+
+    try:
+        async with processing_slots:
+            # processing is CPU heavy - run it in a thread so the server stays responsive
+            await asyncio.to_thread(remove_bg, data, output_path, model, alpha_matting)
+    except UserError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return error_page(str(e))
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        log.exception(f"Processing failed for {file.filename!r}")
+        return error_page("The image could not be processed. Please try a different file.", status_code=500)
+
+    log.info(f"Processed {file.filename!r} -> {output_path}")
+    # redirect so refreshing the result page doesn't re-upload the file
+    return RedirectResponse(f"/result/{job_id}", status_code=303)
+
+
+@rt("/result/{job_id}", methods=["GET"])
+def result_page(job_id: str):
+    job_dir = get_job_dir(job_id)
+    result_file = get_result_file(job_dir) if job_dir else None
+    if not result_file:
+        return error_page("This file doesn't exist or has expired. Please upload it again.", status_code=404)
+
+    return page(
+        H1("Background Removed"),
+        P("Preview", cls="select"),
+        Img(src=f"/download/{job_id}", alt="Image with background removed", cls="preview"),
+        P(result_file.name, cls="hint"),
+        A("Download File", href=f"/download/{job_id}", download=result_file.name, cls="button"),
+        A("Process Another Image", href="/", cls="button secondary"),
+    )
+
+
+@rt("/download/{job_id}", methods=["GET"])
+def download(job_id: str):
+    job_dir = get_job_dir(job_id)
+    result_file = get_result_file(job_dir) if job_dir else None
+    if not result_file:
+        return error_page("This file doesn't exist or has expired. Please upload it again.", status_code=404)
+
+    # passing filename= lets Starlette encode non-ASCII names correctly in Content-Disposition
+    return FileResponse(result_file, media_type="image/png", filename=result_file.name)
+
 
 if __name__ == '__main__':
     # Important: Use host='0.0.0.0' to make the server accessible outside the container
-    serve(host='0.0.0.0', port=5005) # type: ignore
+    serve(host='0.0.0.0', port=int(os.getenv("PORT", "5005")), reload="--reload" in sys.argv) # type: ignore
